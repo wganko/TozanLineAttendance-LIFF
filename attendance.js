@@ -78,6 +78,22 @@
     app.append(btn);
   }
 
+  function backToLine(app) {
+    const back = el('button', '回答を終了してLINEに戻る');
+    back.type = 'button';
+    back.className = 'primary';
+    back.addEventListener('click', () => {
+      try {
+        if (liff.isInClient && liff.isInClient()) {
+          liff.closeWindow();
+          return;
+        }
+      } catch (e) { /* 外部ブラウザでは閉じられない */ }
+      say('LINEアプリに戻ってください。');
+    });
+    app.append(back);
+  }
+
   function render(data) {
     state.caseData = data;
     state.caseId = String(data.case.id);
@@ -115,6 +131,7 @@
       app.append(answerSummary());
       app.append(el('p', '回答期限までは、下のボタンから変更できます。'));
       changeButton(app, '回答を変更する');
+      backToLine(app);
       say('');
       return;
     }
@@ -122,6 +139,7 @@
     if (state.view === 'summary') {
       app.append(answerSummary());
       changeButton(app, '回答を変更する');
+      backToLine(app);
       say('');
       return;
     }

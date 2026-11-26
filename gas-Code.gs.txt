@@ -1,0 +1,486 @@
+/**
+ * 支部LINE出欠確認 — Google Apps Script バックエンド
+ *
+ * 役割
+ *  - 公開API（doPost）: LIFF から受け取った ID トークンを検証し、案件の読み取りと回答の保存を行う
+ *  - 配信（手動実行）: 案件の対象者へ LINE で案内・再送を送る
+ *  - 集計: スプレッドシート「回答」タブをそのまま見る（管理画面は今回の範囲外）
+ *
+ * 秘密情報（スクリプトプロパティ）
+ *  - LOGIN_CHANNEL_ID : LIFF のチャネルID（IDトークンの aud）
+ *  - MESSAGING_TOKEN  : 都山流香川県支部 Messaging API のチャネルアクセストークン
+ */
+
+// ============================================================
+// ここだけ設定する（支部公式アカウント kagawa.tozan@gmail.com で作業）
+// ============================================================
+const CONFIG = {
+  LOGIN_CHANNEL_ID: '2008582229',
+  MESSAGING_CHANNEL_ID: '2006778241',
+  MESSAGING_CHANNEL_SECRET: '★ここにチャネルシークレットを貼る★',
+};
+
+const SHEET_NAMES = {
+  cases: '案件',
+  questions: '質問',
+  targets: '対象者',
+  answers: '回答',
+  sends: '配信',
+};
+
+const HEADERS = {
+  cases: ['caseId', 'name', 'description', 'deadline', 'status', 'createdAt'],
+  questions: ['caseId', 'questionKey', 'prompt', 'displayOrder', 'isRequired'],
+  targets: ['caseId', 'memberCode', 'name', 'lineUserId'],
+  answers: ['caseId', 'lineUserId', 'questionKey', 'answer', 'receivedAt'],
+  sends: ['caseId', 'lineUserId', 'kind', 'sentAt', 'requestId'],
+};
+
+const NOTE_KEY = 'notes';
+const MAX_NOTE_LENGTH = 2000;
+
+function props_() {
+  const real = PropertiesService.getScriptProperties();
+  return {
+    getProperty: function (k) {
+      const v = CONFIG[k];
+      return (v && String(v).indexOf('★') < 0) ? v : real.getProperty(k);
+    },
+    setProperty: function (k, v) { return real.setProperty(k, v); },
+  };
+}
+
+function ss_() {
+  let ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (ss) return ss;
+  const id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (id) return SpreadsheetApp.openById(id);
+  ss = SpreadsheetApp.create('支部LINE出欠確認');
+  PropertiesService.getScriptProperties().setProperty('SPREADSHEET_ID', ss.getId());
+  return ss;
+}
+
+function sheet_(key) {
+  const name = SHEET_NAMES[key];
+  const ss = ss_();
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.appendRow(HEADERS[key]);
+  }
+  return sh;
+}
+
+function readRows_(key) {
+  const sh = sheet_(key);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const header = values[0];
+  return values.slice(1).map((row) => {
+    const obj = {};
+    header.forEach((h, i) => { obj[h] = row[i]; });
+    return obj;
+  });
+}
+
+// ---------------------------------------------------------------- 公開API
+
+function doPost(e) {
+  let body;
+  try {
+    body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+  } catch (err) {
+    return json_({ error: 'bad_request' }, 400);
+  }
+  if (body.admin) {
+    if (body.admin !== adminToken_()) return json_({ error: 'not_found' }, 404);
+    try {
+      if (body.action === 'import') return json_({ ok: true, added: importRows_(body.caseId || '20261213', body.rows || []) }, 200);
+      if (body.action === 'activate') return json_({ ok: true, status: activateCase(body.caseId || '20261213') }, 200);
+      if (body.action === 'report') return json_(report_(body.caseId || '20261213'), 200);
+      if (body.action === 'send') {
+        return json_({ ok: true, results: sendInvitation(body.caseId || '20261213', String(body.message || '')) }, 200);
+      }
+      if (body.action === 'sendReminder') {
+        return json_({ ok: true, results: sendReminder(body.caseId || '20261213', String(body.message || '')) }, 200);
+      }
+      if (body.action === 'test') return json_({ ok: true, tokenOk: true }, 200);
+      return json_({ error: 'bad_request' }, 400);
+    } catch (err) {
+      return json_({ error: String((err && err.message) || err) }, 500);
+    }
+  }
+  try {
+    const sub = verifyIdToken_(String(body.idToken || ''));
+    const caseId = String(body.caseId || '');
+    if (!caseId) return json_({ error: 'bad_request' }, 400);
+    if (body.action === 'read') return json_(readCase_(caseId, sub));
+    if (body.action === 'save') return json_(saveAnswers_(caseId, sub, body.answers));
+    return json_({ error: 'bad_request' }, 400);
+  } catch (err) {
+    const code = String(err && err.message);
+    if (code === 'invalid_token') return json_({ error: 'invalid_token' }, 401);
+    if (code === 'not_target') return json_({ error: 'not_target' }, 404);
+    return json_({ error: 'server_error' }, 500);
+  }
+}
+
+function doGet(e) {
+  const p = (e && e.parameter) || {};
+  if (!p.admin || p.admin !== adminToken_()) {
+    return json_({ error: 'not_found' }, 404);
+  }
+  try {
+    if (p.action === 'setup') {
+      const caseId = setupTrialCase();
+      const imported = importTargets(caseId);
+      return json_({ ok: true, caseId, imported }, 200);
+    }
+    if (p.action === 'activate') {
+      return json_({ ok: true, status: activateCase(p.caseId || '20261213') }, 200);
+    }
+    if (p.action === 'close') {
+      return json_({ ok: true, status: closeCase(p.caseId || '20261213') }, 200);
+    }
+    if (p.action === 'report') {
+      return json_(report_(p.caseId || '20261213'), 200);
+    }
+    return json_({ error: 'bad_request' }, 400);
+  } catch (err) {
+    return json_({ error: String(err && err.message || err) }, 500);
+  }
+}
+
+function adminToken_() {
+  const secret = props_().getProperty('MESSAGING_CHANNEL_SECRET');
+  if (!secret) return '';
+  const raw = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, secret + 'tozan-admin');
+  return raw.map(function (b) { return ('0' + (b & 0xff).toString(16)).slice(-2); }).join('').slice(0, 32);
+}
+
+function report_(caseId) {
+  const qs = questionsOf_(String(caseId));
+  const targets = readRows_('targets').filter((t) => String(t.caseId) === String(caseId));
+  const answers = readRows_('answers').filter((r) => String(r.caseId) === String(caseId));
+  const byUser = {};
+  answers.forEach((r) => {
+    const u = String(r.lineUserId);
+    byUser[u] = byUser[u] || {};
+    byUser[u][String(r.questionKey)] = String(r.answer);
+  });
+  const required = qs.filter((q) => q.is_required);
+  const counts = {};
+  required.forEach((q) => { counts[q.question_key] = { 出席: 0, 欠席: 0 }; });
+  let answered = 0;
+  targets.forEach((t) => {
+    const a = byUser[String(t.lineUserId)] || {};
+    const complete = required.every((q) => a[q.question_key] === '出席' || a[q.question_key] === '欠席');
+    if (complete) answered++;
+    required.forEach((q) => {
+      if (counts[q.question_key][a[q.question_key]] !== undefined) counts[q.question_key][a[q.question_key]]++;
+    });
+  });
+  return {
+    caseId,
+    targetCount: targets.length,
+    answeredCount: answered,
+    unansweredCount: targets.length - answered,
+    counts,
+  };
+}
+
+function json_(obj, status) {
+  const out = ContentService.createTextOutput(JSON.stringify(obj));
+  out.setMimeType(ContentService.MimeType.JSON);
+  return out;
+}
+
+function verifyIdToken_(idToken) {
+  const channelId = props_().getProperty('LOGIN_CHANNEL_ID');
+  if (!channelId || !idToken) throw new Error('invalid_token');
+  const res = UrlFetchApp.fetch('https://api.line.me/oauth2/v2.1/verify', {
+    method: 'post',
+    payload: { id_token: idToken, client_id: channelId },
+    muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() !== 200) throw new Error('invalid_token');
+  const claims = JSON.parse(res.getContentText());
+  if (claims.aud !== channelId) throw new Error('invalid_token');
+  if (!claims.exp || Number(claims.exp) * 1000 <= Date.now()) throw new Error('invalid_token');
+  const sub = String(claims.sub || '');
+  if (!/^U[0-9a-f]{32}$/.test(sub)) throw new Error('invalid_token');
+  return sub;
+}
+
+function findCase_(caseId) {
+  const row = readRows_('cases').find((r) => String(r.caseId) === caseId);
+  if (!row) return null;
+  return {
+    id: row.caseId,
+    name: row.name,
+    description: row.description,
+    deadline: new Date(row.deadline).toISOString(),
+    status: String(row.status),
+  };
+}
+
+function questionsOf_(caseId) {
+  return readRows_('questions')
+    .filter((r) => String(r.caseId) === caseId)
+    .sort((a, b) => Number(a.displayOrder) - Number(b.displayOrder))
+    .map((r) => ({
+      question_key: String(r.questionKey),
+      prompt: String(r.prompt),
+      is_required: r.isRequired === true || String(r.isRequired).toLowerCase() === 'true',
+    }));
+}
+
+function answersOf_(caseId, sub) {
+  const out = {};
+  readRows_('answers')
+    .filter((r) => String(r.caseId) === caseId && String(r.lineUserId) === sub)
+    .forEach((r) => { out[String(r.questionKey)] = String(r.answer); });
+  return out;
+}
+
+function readCase_(caseId, sub) {
+  const c = findCase_(caseId);
+  if (!c || (c.status !== 'accepting' && c.status !== 'closed')) throw new Error('not_target');
+  const isTarget = readRows_('targets')
+    .some((r) => String(r.caseId) === caseId && String(r.lineUserId) === sub);
+  if (!isTarget) throw new Error('not_target');
+  return {
+    case: c,
+    questions: questionsOf_(caseId),
+    answers: answersOf_(caseId, sub),
+  };
+}
+
+function saveAnswers_(caseId, sub, answers) {
+  const c = findCase_(caseId);
+  if (!c) throw new Error('not_target');
+  const targets = readRows_('targets')
+    .filter((r) => String(r.caseId) === caseId && String(r.lineUserId) === sub);
+  if (!targets.length) throw new Error('not_target');
+  if (c.status !== 'accepting') return { saved: false, reason: 'not_accepting' };
+  if (new Date(c.deadline).getTime() <= Date.now()) return { saved: false, reason: 'not_accepting' };
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
+    return { saved: false, reason: 'invalid_answers' };
+  }
+
+  const questions = questionsOf_(caseId);
+  const required = questions.filter((q) => q.is_required);
+  if (!required.length) return { saved: false, reason: 'invalid_answers' };
+
+  for (const q of questions) {
+    const v = answers[q.question_key];
+    if (q.is_required) {
+      if (typeof v !== 'string' || (v !== '出席' && v !== '欠席')) {
+        return { saved: false, reason: 'invalid_answers' };
+      }
+    } else if (q.question_key === NOTE_KEY) {
+      if (v !== undefined && typeof v !== 'string') return { saved: false, reason: 'invalid_answers' };
+      if (typeof v === 'string' && v.length > MAX_NOTE_LENGTH) {
+        return { saved: false, reason: 'invalid_answers' };
+      }
+    }
+  }
+  const known = {};
+  questions.forEach((q) => { known[q.question_key] = true; });
+  for (const k of Object.keys(answers)) {
+    if (!known[k]) return { saved: false, reason: 'invalid_answers' };
+  }
+
+  const now = new Date();
+  const sh = sheet_('answers');
+  const rows = readRows_('answers');
+  const values = sh.getDataRange().getValues();
+  let appended = false;
+
+  questions.forEach((q) => {
+    const value = q.is_required ? answers[q.question_key]
+      : (typeof answers[q.question_key] === 'string' ? answers[q.question_key] : '');
+    const idx = rows.findIndex((r) => String(r.caseId) === caseId
+      && String(r.lineUserId) === sub && String(r.questionKey) === q.question_key);
+    if (idx >= 0) {
+      const sheetRow = idx + 2;
+      sh.getRange(sheetRow, 4, 1, 2).setValues([[value, now]]);
+    } else {
+      sh.appendRow([caseId, sub, q.question_key, value, now]);
+      rows.push({ caseId, lineUserId: sub, questionKey: q.question_key });
+      appended = true;
+    }
+  });
+  if (appended && values.length === 1) { /* 見出しのみの状態から追加済み */ }
+  return { saved: true, received_at: now.toISOString() };
+}
+
+// ---------------------------------------------------------------- 配信（手動実行）
+
+function sendInvitation(caseId, message) {
+  return sendTo_(caseId, message, 'invitation', null);
+}
+
+function sendReminder(caseId, message) {
+  const answered = {};
+  readRows_('answers').forEach((r) => {
+    if (String(r.caseId) === String(caseId)) {
+      answered[String(r.lineUserId) + '\t' + String(r.questionKey)] = true;
+    }
+  });
+  const required = questionsOf_(String(caseId)).filter((q) => q.is_required);
+  const skip = {};
+  readRows_('targets')
+    .filter((t) => String(t.caseId) === String(caseId))
+    .forEach((t) => {
+      const uid = String(t.lineUserId);
+      const complete = required.every((q) => answered[uid + '\t' + q.question_key]);
+      if (complete) skip[uid] = true;
+    });
+  return sendTo_(caseId, message, 'reminder', skip);
+}
+
+function sendTo_(caseId, message, kind, skip) {
+  const token = accessToken_();
+  if (!message || !String(message).trim()) throw new Error('本文が空です');
+  const already = {};
+  readRows_('sends').forEach((r) => {
+    if (String(r.caseId) === String(caseId) && String(r.kind) === kind) {
+      already[String(r.lineUserId)] = true;
+    }
+  });
+  const targets = readRows_('targets').filter((t) => String(t.caseId) === String(caseId));
+  const results = [];
+  targets.forEach((t) => {
+    const uid = String(t.lineUserId);
+    if (!uid || already[uid] || (skip && skip[uid])) return;
+    const res = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/push', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + token, 'X-Line-Retry-Key': Utilities.getUuid() },
+      payload: JSON.stringify({ to: uid, messages: [{ type: 'text', text: String(message) }] }),
+      muteHttpExceptions: true,
+    });
+    const code = res.getResponseCode();
+    if (code === 200) {
+      sheet_('sends').appendRow([caseId, uid, kind, new Date(), res.getHeaders()['x-line-request-id'] || '']);
+      results.push({ ok: true, code });
+    } else {
+      results.push({ ok: false, code, body: res.getContentText().slice(0, 120) });
+    }
+    Utilities.sleep(120);
+  });
+  return results;
+}
+
+// ---------------------------------------------------------------- 初期データ投入
+
+// ---------------------------------------------------------------- 認証・初期データ
+
+function accessToken_() {
+  const p = props_();
+  const cached = p.getProperty('ACCESS_TOKEN');
+  const exp = Number(p.getProperty('ACCESS_TOKEN_EXP') || 0);
+  if (cached && exp > Date.now() + 60000) return cached;
+  const channelId = p.getProperty('MESSAGING_CHANNEL_ID');
+  const secret = p.getProperty('MESSAGING_CHANNEL_SECRET');
+  if (!channelId || !secret) throw new Error('MESSAGING_CHANNEL_ID / SECRET が未設定です');
+  const res = UrlFetchApp.fetch('https://api.line.me/v2/oauth/accessToken', {
+    method: 'post',
+    payload: { grant_type: 'client_credentials', client_id: channelId, client_secret: secret },
+    muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() !== 200) throw new Error('トークン取得に失敗');
+  const d = JSON.parse(res.getContentText());
+  p.setProperty('ACCESS_TOKEN', d.access_token);
+  p.setProperty('ACCESS_TOKEN_EXP', String(Date.now() + Number(d.expires_in || 0) * 1000));
+  return d.access_token;
+}
+
+/** 対象者を Drive の役員名簿CSVから取り込む（PIIはリポジトリに置かない）。 */
+function importTargets(caseId) {
+  const name = 'LINE登録中全役員名簿_39609_20261124141423.csv';
+  const files = DriveApp.getFilesByName(name);
+  if (!files.hasNext()) throw new Error('名簿CSVが見つかりません: ' + name);
+  const bytes = files.next().getBlob().getBytes();
+  const text = Utilities.newBlob(bytes).getDataAsString('Shift_JIS');
+  const rows = Utilities.parseCsv(text);
+  const sh = sheet_('targets');
+  const existing = readRows_('targets').filter((r) => String(r.caseId) === String(caseId));
+  const have = {};
+  existing.forEach((r) => { have[String(r.lineUserId)] = true; });
+  let added = 0;
+  rows.slice(2).forEach((r) => {
+    const uid = String(r[0] || '').trim();
+    if (!/^U[0-9a-f]{32}$/.test(uid) || have[uid]) return;
+    sh.appendRow([caseId, '', String(r[2] || '').trim(), uid]);
+    added++;
+  });
+  return { added, total: existing.length + added };
+}
+
+/** 管理APIから渡された対象者を登録する（Driveに依存しない）。 */
+function importRows_(caseId, rows) {
+  const sh = sheet_('targets');
+  const have = {};
+  readRows_('targets').filter((r) => String(r.caseId) === String(caseId))
+    .forEach((r) => { have[String(r.lineUserId)] = true; });
+  let added = 0;
+  rows.forEach((r) => {
+    const uid = String(r.lineUserId || '').trim();
+    if (!/^U[0-9a-f]{32}$/.test(uid) || have[uid]) return;
+    sh.appendRow([caseId, String(r.memberCode || ''), String(r.name || ''), uid]);
+    have[uid] = true;
+    added++;
+  });
+  return added;
+}
+
+function activateCase(caseId) {
+  const sh = sheet_('cases');
+  const values = sh.getDataRange().getValues();
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === String(caseId)) {
+      sh.getRange(i + 1, 5).setValue('accepting');
+      return 'accepting';
+    }
+  }
+  throw new Error('案件がありません');
+}
+
+function closeCase(caseId) {
+  const sh = sheet_('cases');
+  const values = sh.getDataRange().getValues();
+  for (let i = 1; i < values.length; i++) {
+    if (String(values[i][0]) === String(caseId)) {
+      sh.getRange(i + 1, 5).setValue('closed');
+      return 'closed';
+    }
+  }
+  throw new Error('案件がありません');
+}
+
+/** 初回セットアップ。エディタから1回実行する。 */
+function setupAll() {
+  const caseId = setupTrialCase();
+  const ss = ss_();
+  const url = ss.getUrl();
+  Logger.log('スプレッドシート: ' + url);
+  return { caseId, spreadsheet: url };
+}
+
+function setupTrialCase() {
+  const caseId = '20261213';
+  const sh = sheet_('cases');
+  const exists = readRows_('cases').some((r) => String(r.caseId) === caseId);
+  if (!exists) {
+    sh.appendRow([caseId, '12月13日 全役員会・忘年会', '都山流香川県支部', '2026-12-08T23:59:59+09:00', 'preparing', new Date()]);
+  }
+  const q = sheet_('questions');
+  if (!readRows_('questions').some((r) => String(r.caseId) === caseId)) {
+    q.appendRow([caseId, 'meeting', '全役員会（15:30〜16:30 サンポートホール高松7階 第3リハーサル室）', 1, true]);
+    q.appendRow([caseId, 'party', '忘年会（17:00〜19:00 魚民 高松駅前店 会費6,000円）', 2, true]);
+    q.appendRow([caseId, NOTE_KEY, '備考（任意）', 3, false]);
+  }
+  return caseId;
+}

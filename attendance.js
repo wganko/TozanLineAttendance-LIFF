@@ -130,7 +130,7 @@
     const inputs = [];
     state.questions.forEach((q, i) => {
       const fs = el('fieldset');
-      fs.append(el('legend', q.prompt + (q.is_required ? '' : '（任意）')));
+      fs.append(el('legend', q.is_required || q.prompt.includes('任意') ? q.prompt : q.prompt + '（任意）'));
       if (q.is_required) {
         const wrap = el('div');
         wrap.className = 'choices';

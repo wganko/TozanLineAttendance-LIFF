@@ -66,7 +66,18 @@ button:disabled { opacity: .55; }
 dl { margin: 0; }
 dt { font-weight: 600; margin-top: 8px; }
 dd { margin: 0 0 4px 0; }
-#status { margin: 12px 0; }
-#status.error { color: #8a1c1c; }
+#status {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: #23543c;
+  color: #fff;
+  font-size: 1.05rem;
+  font-weight: 700;
+  text-align: center;
+  letter-spacing: .02em;
+}
+#status[hidden] { display: none; }
+#status.error { background: #8a1c1c; color: #fff; }
 section.done { border-color: #23543c; background: #e4f1e7; }
 section.done h2 { margin-top: 0; }

@@ -103,7 +103,7 @@
     state.answers = {};
     state.view = 'form';
     draw();
-    say('よみこみちゅうです…');
+    say('前回の回答を読み込んでいます…');
     return true;
   }
 
@@ -214,7 +214,7 @@
       }
       state.busy = true;
       submit.disabled = true;
-      say('保存しています。');
+      say('保存しています…');
       try {
         const r = await api({ action: 'save', idToken: window.__idToken, caseId: state.caseId, answers });
         if (r.saved) {

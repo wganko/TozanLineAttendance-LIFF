@@ -68,3 +68,5 @@ dt { font-weight: 600; margin-top: 8px; }
 dd { margin: 0 0 4px 0; }
 #status { margin: 12px 0; }
 #status.error { color: #8a1c1c; }
+section.done { border-color: #23543c; background: #e4f1e7; }
+section.done h2 { margin-top: 0; }

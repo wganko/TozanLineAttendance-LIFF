@@ -3,8 +3,10 @@
 (function () {
   const cfg = window.ATTENDANCE_CONFIG || {};
   const statusEl = document.getElementById('status');
-  const NOTE_KEY = 'notes';
-  const state = { caseId: '', questions: [], answers: {}, accepting: false, busy: false, editing: false, caseData: null };
+  const state = {
+    caseId: '', questions: [], answers: {}, caseData: null,
+    accepting: false, busy: false, view: 'form',
+  };
 
   function say(text, isError) {
     statusEl.textContent = text || '';
@@ -51,12 +53,37 @@
     });
   }
 
+  function answerSummary() {
+    const box = el('section');
+    box.append(el('h2', '回答の内容'));
+    const dl = el('dl');
+    state.questions.forEach((q) => {
+      const v = state.answers[q.question_key];
+      if (v === undefined) return;
+      dl.append(el('dt', q.prompt), el('dd', v === '' ? '（未記入）' : v));
+    });
+    box.append(dl);
+    return box;
+  }
+
+  function changeButton(app, label) {
+    const btn = el('button', label);
+    btn.type = 'button';
+    btn.addEventListener('click', () => {
+      state.view = 'form';
+      draw();
+      const first = document.querySelector('input[type=radio], textarea');
+      if (first) first.focus();
+    });
+    app.append(btn);
+  }
+
   function render(data) {
     state.caseData = data;
     state.caseId = String(data.case.id);
     state.questions = data.questions || [];
     state.answers = data.answers || {};
-    state.editing = !Object.keys(state.answers).length;
+    state.view = Object.keys(state.answers).length ? 'summary' : 'form';
     draw();
   }
 
@@ -72,35 +99,29 @@
     if (data.case.description) app.append(el('p', data.case.description));
     app.append(el('p', '回答期限：' + deadlineText(data.case.deadline) + '（日本時間）'));
 
-    const hasAnswer = Object.keys(state.answers).length > 0;
-    if (hasAnswer) {
-      const box = el('section');
-      box.append(el('h2', '現在の回答'));
-      const dl = el('dl');
-      state.questions.forEach((q) => {
-        const v = state.answers[q.question_key];
-        if (v === undefined) return;
-        dl.append(el('dt', q.prompt), el('dd', v === '' ? '（未記入）' : v));
-      });
-      box.append(dl);
-      app.append(box);
-    }
-
     if (!state.accepting) {
+      if (Object.keys(state.answers).length) app.append(answerSummary());
       app.append(el('p', '回答受付は終了しました。'));
+      say('');
       return;
     }
 
-    if (hasAnswer && !state.editing) {
-      const change = el('button', '回答を変更する');
-      change.type = 'button';
-      change.addEventListener('click', () => {
-        state.editing = true;
-        draw();
-        const first = document.querySelector('input[type=radio], textarea');
-        if (first) first.focus();
-      });
-      app.append(change);
+    if (state.view === 'done') {
+      const done = el('section');
+      done.className = 'done';
+      done.append(el('h2', 'ご回答ありがとうございました'));
+      done.append(el('p', '下記の内容で受け付けました。'));
+      app.append(done);
+      app.append(answerSummary());
+      app.append(el('p', '回答期限までは、下のボタンから変更できます。'));
+      changeButton(app, '回答を変更する');
+      say('');
+      return;
+    }
+
+    if (state.view === 'summary') {
+      app.append(answerSummary());
+      changeButton(app, '回答を変更する');
       say('');
       return;
     }
@@ -139,10 +160,12 @@
       form.append(fs);
     });
 
-    const submit = el('button', hasAnswer ? '回答を変更する' : '回答を保存する');
+    const hadAnswer = Object.keys(state.answers).length > 0;
+    const submit = el('button', hadAnswer ? 'この内容で保存する' : '回答する');
     submit.type = 'submit';
     form.append(submit);
     app.append(form);
+    say('');
 
     form.addEventListener('submit', async (ev) => {
       ev.preventDefault();
@@ -163,26 +186,26 @@
         const r = await api({ action: 'save', idToken: window.__idToken, caseId: state.caseId, answers });
         if (r.saved) {
           Object.assign(state.answers, answers);
+          state.view = 'done';
           state.busy = false;
-          state.editing = false;
           draw();
-          say('保存しました。期限内は「回答を変更する」から変更できます。');
+          window.scrollTo(0, 0);
           return;
-        } else if (r.reason === 'not_accepting') {
-          say('回答受付は終了しました。', true);
-          return;
-        } else {
-          say('回答を確認してください。出席・欠席をもう一度選んでください。', true);
         }
+        if (r.reason === 'not_accepting') {
+          state.accepting = false;
+          state.busy = false;
+          draw();
+          return;
+        }
+        say('回答を確認してください。出席・欠席をもう一度選んでください。', true);
       } catch (e) {
         say(e.message, true);
       } finally {
         state.busy = false;
-        if (!submit.disabled) submit.disabled = false;
+        submit.disabled = false;
       }
     });
-
-    say('');
   }
 
   async function start() {

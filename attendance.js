@@ -4,7 +4,7 @@
   const cfg = window.ATTENDANCE_CONFIG || {};
   const statusEl = document.getElementById('status');
   const NOTE_KEY = 'notes';
-  const state = { caseId: '', questions: [], answers: {}, accepting: false, busy: false };
+  const state = { caseId: '', questions: [], answers: {}, accepting: false, busy: false, editing: false, caseData: null };
 
   function say(text, isError) {
     statusEl.textContent = text || '';
@@ -52,9 +52,16 @@
   }
 
   function render(data) {
+    state.caseData = data;
     state.caseId = String(data.case.id);
     state.questions = data.questions || [];
     state.answers = data.answers || {};
+    state.editing = !Object.keys(state.answers).length;
+    draw();
+  }
+
+  function draw() {
+    const data = state.caseData;
     state.accepting = data.case.status === 'accepting'
       && new Date(data.case.deadline).getTime() > Date.now();
 
@@ -81,6 +88,19 @@
 
     if (!state.accepting) {
       app.append(el('p', '回答受付は終了しました。'));
+      return;
+    }
+
+    if (hasAnswer && !state.editing) {
+      const change = el('button', '回答を変更する');
+      change.type = 'button';
+      change.addEventListener('click', () => {
+        state.editing = true;
+        draw();
+        const first = document.querySelector('input[type=radio], textarea');
+        if (first) first.focus();
+      });
+      app.append(change);
       say('');
       return;
     }
@@ -143,8 +163,11 @@
         const r = await api({ action: 'save', idToken: window.__idToken, caseId: state.caseId, answers });
         if (r.saved) {
           Object.assign(state.answers, answers);
-          say('保存しました。期限内はこの画面から変更できます。');
-          submit.textContent = '回答を変更する';
+          state.busy = false;
+          state.editing = false;
+          draw();
+          say('保存しました。期限内は「回答を変更する」から変更できます。');
+          return;
         } else if (r.reason === 'not_accepting') {
           say('回答受付は終了しました。', true);
           return;

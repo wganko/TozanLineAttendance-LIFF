@@ -5,7 +5,7 @@
   const statusEl = document.getElementById('status');
   const state = {
     caseId: '', questions: [], answers: {}, caseData: null,
-    accepting: false, busy: false, view: 'form',
+    accepting: false, busy: false, view: 'form', interacted: false,
   };
 
   function say(text, isError) {
@@ -94,6 +94,19 @@
     app.append(back);
   }
 
+  function renderPre(caseId) {
+    const pre = cfg.PRECASE;
+    if (!pre || String(pre.id) !== String(caseId) || !pre.questions) return false;
+    state.caseData = { case: pre, questions: pre.questions, answers: {} };
+    state.caseId = String(pre.id);
+    state.questions = pre.questions;
+    state.answers = {};
+    state.view = 'form';
+    draw();
+    say('よみこみちゅうです…');
+    return true;
+  }
+
   function render(data) {
     state.caseData = data;
     state.caseId = String(data.case.id);
@@ -160,6 +173,7 @@
           radio.value = choice;
           radio.required = true;
           radio.checked = state.answers[q.question_key] === choice;
+          radio.addEventListener('change', () => { state.interacted = true; });
           label.append(radio, document.createTextNode(' ' + choice));
           wrap.append(label);
         });
@@ -172,6 +186,7 @@
         const area = document.createElement('textarea');
         area.rows = 3;
         area.value = state.answers[q.question_key] || '';
+        area.addEventListener('input', () => { state.interacted = true; });
         fs.append(area);
         inputs.push({ key: q.question_key, get: () => area.value });
       }
@@ -232,6 +247,8 @@
       return;
     }
     try {
+      const earlyCaseId = caseIdFromPath() || cfg.CASE_ID || '';
+      if (earlyCaseId) renderPre(earlyCaseId);
       await liff.init({ liffId: cfg.LIFF_ID });
       if (!liff.isLoggedIn()) {
         if (liff.isInClient()) {
@@ -246,13 +263,18 @@
         say('LINEの認証情報を取得できませんでした。開き直してください。', true);
         return;
       }
-      say('読み込んでいます。');
       const caseId = caseIdFromPath() || cfg.CASE_ID || '';
       if (!caseId) {
         say('案内されたリンクから開いてください。', true);
         return;
       }
-      render(await api({ action: 'read', idToken: window.__idToken, caseId }));
+      const data = await api({ action: 'read', idToken: window.__idToken, caseId });
+      if (state.caseData && state.interacted) {
+        state.answers = data.answers || {};
+        say('');
+        return;
+      }
+      render(data);
     } catch (e) {
       say(e.message || '開けませんでした。時間をおいて開き直してください。', true);
     }
